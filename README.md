@@ -12,7 +12,7 @@ A simple installer and manager script for nftables-based DDoS protection.
 - Rate-limits SYN floods  
 - Manages configuration via the `rofirewall` command  
 
----
+````
 
 ## Installation
 
