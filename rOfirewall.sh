@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rOfirewall - NFTables DDoS Shield V2.0
+# rOfirewall - IPTables DDoS Shield V2.0
 # INSTALLS DEPENDENCIES, MANAGES PORTS, COUNTRY/ASN BLOCK LISTS, WHITELIST IPS, APPLIES RULES
 ######################################################
 
@@ -18,31 +18,31 @@ if [[ "$1" == "install" ]]; then
   exit 0
 fi
 
-# 2) INSTALL DEPENDENCIES (nftables, curl, whois)
+# 2) INSTALL DEPENDENCIES (iptables, ipset, curl, whois)
 if command -v apt-get &>/dev/null; then
-  apt-get update && apt-get install -y nftables curl whois
+  apt-get update && apt-get install -y iptables ipset curl whois
 elif command -v dnf &>/dev/null; then
-  dnf install -y nftables curl whois
+  dnf install -y iptables-services ipset curl whois
 elif command -v yum &>/dev/null; then
-  yum install -y nftables curl whois
+  yum install -y iptables-services ipset curl whois
 elif command -v pacman &>/dev/null; then
-  pacman -Sy --noconfirm nftables curl whois
+  pacman -Sy --noconfirm iptables ipset curl whois
 else
-  echo "Package manager not detected. Please install nftables, curl, and whois manually." >&2
+  echo "Package manager not detected. Please install iptables, ipset, curl, and whois manually." >&2
   exit 1
 fi
-# Enable and start nftables
-systemctl enable nftables --now
+# Ensure iptables service running
+systemctl enable iptables --now
+systemctl enable ip6tables --now
 
 # 3) CONFIGURATION
 ZONE_DIR="/usr/local/bin"
-RATE_LIMIT=5   # SYN/sec per-source
+RATE_LIMIT=5     # max new connections per second per IP
 PORT_FILE="$ZONE_DIR/ports.list"
-BLOCK_ZONE_FILE="$ZONE_DIR/block.zone"
-ASN_ZONE_SUFFIX=".zone"
 WHITELIST_FILE="$ZONE_DIR/whitelist.zone"
+ASN_ZONE_SUFFIX=".zone"
 
-# Ensure default ports file exists
+# Default ports list
 if [[ ! -f "$PORT_FILE" ]]; then
   cat > "$PORT_FILE" <<EOF
 6900
@@ -57,161 +57,103 @@ if [[ ! -f "$PORT_FILE" ]]; then
 22
 EOF
 fi
-
-# Ensure whitelist file exists
+# Default whitelist
 if [[ ! -f "$WHITELIST_FILE" ]]; then
   touch "$WHITELIST_FILE"
 fi
 
-# Read ports into nft-friendly set
-PORTS=$(awk '{printf "%s,", \$1}' "$PORT_FILE" | sed 's/,$//')
-PORTS="{${PORTS}}"
-
-# Utility: download and add a country block list file
-add-block-zone() {
-  local url="$1"
-  local file="$ZONE_DIR/$(basename "$url")"
-  echo "[+] Fetching country list: $url -> $file"
-  curl -fsSL "$url" -o "$file"
-  echo "[+] Added block-zone file: $file"
-}
-
-# Utility: fetch ASN prefixes via RADB
-add-block-asn() {
-  local asn="$1"
-  local file="$ZONE_DIR/AS${asn}${ASN_ZONE_SUFFIX}"
-  echo "[+] Fetching ASN $asn prefixes -> $file"
-  whois -h whois.radb.net "-i origin AS${asn}" \
-    | awk '/route:/ {print \$2}' > "$file"
-  echo "[+] Added ASN block list: $file"
-}
-
-# Utility: add a port to the ports file
+# UTILITIES
 add-port() {
-  local port="$1"
-  if ! [[ "$port" =~ ^[0-9]+$ ]]; then
-    echo "Error: Port must be a number." >&2
-    exit 1
-  fi
-  if grep -qx "$port" "$PORT_FILE"; then
-    echo "Port $port already in whitelist." >&2
-  else
+  [[ -z "$2" ]] && echo "Usage: rofirewall add-port <PORT>" && exit 1
+  local port="$2"
+  if ! grep -qx "$port" "$PORT_FILE"; then
     echo "$port" >> "$PORT_FILE"
-    echo "[+] Added port to whitelist: $port"
+    echo "[+] Added port: $port"
+  else
+    echo "Port $port already exists."
   fi
 }
-
-# Utility: whitelist a single IP
+add-block-zone() {
+  [[ -z "$2" ]] && echo "Usage: rofirewall add-block-zone <URL>" && exit 1
+  local url="$2" file="$ZONE_DIR/$(basename "$url")"
+  curl -fsSL "$url" -o "$file"
+  echo "[+] Added zone: $file"
+}
+add-block-asn() {
+  [[ -z "$2" ]] && echo "Usage: rofirewall add-block-asn <ASN>" && exit 1
+  local asn="$2" file="$ZONE_DIR/AS${asn}${ASN_ZONE_SUFFIX}"
+  whois -h whois.radb.net "-i origin AS${asn}" | awk '/route:/ {print \$2}' > "$file"
+  echo "[+] Added ASN zone: $file"
+}
 whitelist-ip() {
-  local ip="$1"
-  if ! [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-    echo "Error: Invalid IPv4 address." >&2
-    exit 1
-  fi
-  if grep -qx "$ip" "$WHITELIST_FILE"; then
-    echo "IP $ip already whitelisted." >&2
-  else
+  [[ -z "$2" ]] && echo "Usage: rofirewall whitelist-ip <IP>" && exit 1
+  local ip="$2"
+  if ! grep -qx "$ip" "$WHITELIST_FILE"; then
     echo "$ip" >> "$WHITELIST_FILE"
     echo "[+] Whitelisted IP: $ip"
+  else
+    echo "IP $ip already whitelisted."
   fi
 }
 
 # 4) COMMAND-LINE MODES
 case "$1" in
-  install)
-    # handled above
-    ;;
-  add-port)
-    add-port "$2"; exit 0
-    ;;
-  add-block-zone)
-    add-block-zone "$2"; exit 0
-    ;;
-  add-block-asn)
-    add-block-asn "$2"; exit 0
-    ;;
-  whitelist-ip)
-    whitelist-ip "$2"; exit 0
-    ;;
-  *)
-    # full apply
-    ;;
+  install) ;;  # handled
+  add-port) add-port "$@"; exit 0;;
+  add-block-zone) add-block-zone "$@"; exit 0;;
+  add-block-asn) add-block-asn "$@"; exit 0;;
+  whitelist-ip) whitelist-ip "$@"; exit 0;;
+  *) ;;  # proceed
 esac
 
-# 5) FETCH default block-zone (China)
-add-block-zone https://www.ipdeny.com/ipblocks/data/countries/cn.zone
+# 5) FETCH default China zone
+add-block-zone "$2" https://www.ipdeny.com/ipblocks/data/countries/cn.zone || true
 
-# 6) FLUSH existing nftables ruleset
-nft flush ruleset
+# 6) FLUSH iptables & ipset
+iptables -F
+iptables -X
+ipset destroy || true
 
-# 7) DEFINE table, sets, and chains
-nft <<-EOF
- table inet filter {
-  set whitelist     { type ipv4_addr; flags interval; }
-  set block_zone    { type ipv4_addr; flags interval; }
-  set block_asn     { type ipv4_addr; flags interval; }
-  set allowed_ports { type integer; flags interval; }
+# 7) CREATE IPSETS
+ipset create block_zone hash:net -exist
+ipset create block_asn hash:net -exist
+ipset create whitelist hash:ip -exist
 
-  chain input {
-    type filter hook input priority 0; policy drop;
-
-    # allow loopback & established
-    iif "lo" accept
-    ct state established,related accept
-
-    # allow whitelisted IPs
-    ip saddr @whitelist accept
-
-    # drop blacklisted zones & ASNs
-    ip saddr @block_zone drop
-    ip saddr @block_asn  drop
-
-    # allow SSH
-    tcp dport 22 ct state new accept
-
-    # allow game ports from allowed_ports set
-    tcp dport @allowed_ports ct state new accept
-
-    # SYN-flood protection
-    tcp flags syn ct state new limit rate $RATE_LIMIT/second drop
-
-    # default drop
-    drop
-  }
-
-  chain forward { type filter hook forward priority 0; policy drop; }
-  chain output  { type filter hook output  priority 0; policy accept; }
- }
-EOF
-
-# 8) POPULATE sets from files
-# whitelist
-while IFS= read -r ip; do
-  [[ "$ip" =~ ^# || -z "$ip" ]] && continue
-  nft add element inet filter whitelist { $ip }
-done < "$WHITELIST_FILE"
-
-# block_zone (all .zone except ports.list & whitelist)
+# Populate whitelist
+while read -r ip; do [[ "$ip" =~ ^#|^$ ]] && continue; ipset add whitelist "$ip" -exist; done < "$WHITELIST_FILE"
+# Populate block zones & ASNs
 for file in "$ZONE_DIR"/*.zone; do
-  case "$(basename "$file")" in
-    whitelist.zone|ports.list) continue;;
-  esac
-  while IFS= read -r ip; do
-    [[ "$ip" =~ ^# || -z "$ip" ]] && continue
-    # determine set: if name starts with AS -> block_asn else block_zone
-    if [[ "$(basename "$file")" =~ ^AS[0-9]+ ]]; then
-      nft add element inet filter block_asn { $ip }
-    else
-      nft add element inet filter block_zone { $ip }
-    fi
-  done < "$file"
+  base=$(basename "$file")
+  set="block_zone"
+  [[ "$base" =~ ^AS[0-9]+ ]] && set="block_asn"
+  while read -r ip; do [[ "$ip" =~ ^#|^$ ]] && continue; ipset add "$set" "$ip" -exist; done < "$file"
 done
 
-# allowed_ports
-for port in $(awk '{print $1}' "$PORT_FILE"); do
-  nft add element inet filter allowed_ports { $port }
-done
+# 8) BUILD iptables rules
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
+# Allow loopback & established
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# Accept whitelisted
+iptables -A INPUT -m set --match-set whitelist src -j ACCEPT
+# Drop blocked
+iptables -A INPUT -m set --match-set block_zone src -j DROP
+iptables -A INPUT -m set --match-set block_asn src -j DROP
+# Allow SSH
+iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+# Allow game ports
+while read -r p; do
+  iptables -A INPUT -p tcp --dport "$p" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+  # rate-limit
+  iptables -A INPUT -p tcp --dport "$p" -m limit --limit "$RATE_LIMIT/sec" --limit-burst "$RATE_LIMIT" -j ACCEPT
+done < "$PORT_FILE"
+# Drop rest
+iptables -A INPUT -j DROP
 
-# 9) DONE
+# 9) SAVE
+iptables-save > /etc/iptables/rules.v4
+ipset save > /etc/iptables/ipsets.conf
 
-echo "✅ rofirewall loaded: ports ($(paste -sd, "$PORT_FILE")), blocks & whitelists applied."
+echo "✅ rofirewall (iptables) loaded: ports ($(paste -sd, "$PORT_FILE")), blocks & whitelists applied."
