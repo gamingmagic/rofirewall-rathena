@@ -1,4 +1,9 @@
-sudo tee /usr/local/bin/rofirewall >/dev/null <<'EOF'
+#How to use:
+#sudo rofirewall start or sudo rofirewall restart — apply everything!
+#sudo rofirewall clear-all — remove all rules.
+#sudo rofirewall forward <IP> <PORTS> — add forwarding rule(s) on top of this config.
+#sudo tee /usr/local/bin/rofirewall >/dev/null <<'EOF'
+
 #!/usr/bin/env bash
 # rOfirewall - DDoS + NAT + Custom Filters + Country Allow + Forward + Start/Restart + HTTP Block + Clear
 
