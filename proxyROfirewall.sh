@@ -1,6 +1,6 @@
 sudo tee /usr/local/bin/rofirewall >/dev/null <<'EOF'
 #!/usr/bin/env bash
-# rOfirewall - IPTables DDoS Shield V2.0 + Port Forwarding (no auto-install)
+# rOfirewall - DDoS + NAT + Custom Filters + Country Allow + Forward + Start/Restart + HTTP Block + Clear
 
 # 0) REQUIRE ROOT
 if [[ $EUID -ne 0 ]]; then
@@ -17,9 +17,7 @@ if [[ "$1" == "install" ]]; then
   exit 0
 fi
 
-# 2) SKIP DEPENDENCY INSTALL
-
-# 3) CONFIGURATION
+# 2) CONFIGURATION
 ZONE_DIR="/usr/local/bin"
 RATE_LIMIT=5
 PORT_FILE="$ZONE_DIR/ports.list"
@@ -83,86 +81,145 @@ forward() {
     echo "Usage: rofirewall forward <IP> <PORT1> [PORT2] [PORT3] [...]"
     exit 1
   fi
-
   local target_ip="$2"
   shift 2
   local ports=( "$@" )
-
-  # Enable IP forwarding
   sysctl -w net.ipv4.ip_forward=1
   sed -i '/^net.ipv4.ip_forward/d' /etc/sysctl.conf
   echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-
-  # Add forwarding rules for each port
   for p in "${ports[@]}"; do
     iptables -t nat -A PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "$target_ip":"$p"
     iptables -t nat -A POSTROUTING -p tcp -d "$target_ip" --dport "$p" -j MASQUERADE
     iptables -A FORWARD -p tcp -d "$target_ip" --dport "$p" -j ACCEPT
     echo "[+] Forwarded port $p to $target_ip"
   done
-
-  # Save rules
   iptables-save > /etc/iptables/rules.v4
-
   echo "✅ Forwarding applied."
+}
+clear-all() {
+  iptables -F
+  iptables -X
+  iptables -t nat -F
+  iptables -t nat -X
+  iptables -t mangle -F
+  iptables -t mangle -X
+  iptables -t raw -F
+  iptables -t raw -X
+  iptables -t security -F
+  iptables -t security -X
+  iptables -P INPUT ACCEPT
+  iptables -P FORWARD ACCEPT
+  iptables -P OUTPUT ACCEPT
+  ipset destroy || true
+  echo "✅ Cleared all iptables rules and reset policies."
 }
 
 # 4) COMMAND-LINE MODES
 case "$1" in
-  install) ;;  # handled above
+  install) ;;
   add-port) add-port "$@"; exit 0;;
   add-block-zone) add-block-zone "$@"; exit 0;;
   add-block-asn) add-block-asn "$@"; exit 0;;
   whitelist-ip) whitelist-ip "$@"; exit 0;;
   forward) forward "$@"; exit 0;;
-  *) ;;  # proceed
+  clear-all) clear-all; exit 0;;
+  start|restart|"") ;; # run default rules for start, restart, or no argument
+  *) ;;      # proceed as default (start)
 esac
 
-# 5) FETCH default China zone
-add-block-zone "$2" https://www.ipdeny.com/ipblocks/data/countries/cn.zone || true
-
-# 6) FLUSH iptables & ipset
+### 1) CLEAN SLATE
 iptables -F
+iptables -t nat -F
 iptables -X
-ipset destroy || true
+iptables -t nat -X
 
-# 7) CREATE IPSETS
+### 2) DEFAULT POLICIES
+iptables -P INPUT   DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT  ACCEPT
+
+### 3) HOST INPUT RULES
+iptables -A INPUT -i lo  -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# Always allow SSH & your app port (22/3000)
+iptables -A INPUT -p tcp --dport 22   -m conntrack --ctstate NEW -j ACCEPT
+iptables -A INPUT -p tcp --dport 3000 -m conntrack --ctstate NEW -j ACCEPT
+
+### 4) FORWARD ESTABLISHED
+iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+### 5) ENABLE NAT
+sysctl -w net.ipv4.ip_forward=1
+iptables -t nat -A POSTROUTING -j MASQUERADE
+
+### 6) CLUSTER A (15.235.159.76)
+iptables -t nat -A PREROUTING -p tcp --dport 6964 -j DNAT --to-destination 15.235.159.76:6964
+iptables -t nat -A PREROUTING -p tcp --dport 6164 -j DNAT --to-destination 15.235.159.76:6164
+iptables -t nat -A PREROUTING -p tcp --dport 5164 -j DNAT --to-destination 15.235.159.76:5164
+
+# Knock→allow for A
+iptables -A FORWARD -p tcp --dport 6964  -m conntrack --ctstate NEW -m recent --name RS_A --set   -j ACCEPT
+iptables -A FORWARD -p tcp --dport 6164  -m conntrack --ctstate NEW -m recent --name RS_A --rcheck --seconds 300 -j ACCEPT
+iptables -A FORWARD -p tcp --dport 5164  -m conntrack --ctstate NEW -m recent --name RS_A --rcheck --seconds 300 -j ACCEPT
+iptables -A FORWARD -p tcp --dport 6164 -j DROP
+iptables -A FORWARD -p tcp --dport 5164 -j DROP
+
+### 7) SKZYONE U32 FILTERS
+iptables -A INPUT -p tcp -m u32 --u32 "6&0xFF=0x6 && 0>>22&0x3C@12&0xFFFFFF00=0x50000000 && 0>>22&0x3C@12>>8&0xFF=0" -j DROP
+iptables -A INPUT -p tcp -m u32 --u32 "6&0xFF=0x6 && 0>>22&0x3C@12&0xFFFFFF00=0x80000000 && 0>>22&0x3C@12>>8&0xFF=0" -j DROP
+iptables -A INPUT -p tcp -m u32 --u32 "6&0xFF=0x6 && 0>>22&0x3C@12&0xFFFFFF00=0x70000000 && 0>>22&0x3C@12>>8&0xFF=0" -j DROP
+
+# COUNTRY ALLOW SYSTEM
+COUNTRIES=(sg ph id th)
+ipset create allow_countries hash:net -exist
+for c in "${COUNTRIES[@]}"; do
+  zonefile="$ZONE_DIR/$c.zone"
+  curl -fsSL "https://www.ipdeny.com/ipblocks/data/countries/$c.zone" -o "$zonefile"
+  while read -r ip; do
+    [[ "$ip" =~ ^#|^$ ]] && continue
+    ipset add allow_countries "$ip" -exist
+  done < "$zonefile"
+done
+
 ipset create block_zone hash:net -exist
 ipset create block_asn hash:net -exist
 ipset create whitelist hash:ip -exist
 
-# Populate whitelist
 while read -r ip; do [[ "$ip" =~ ^#|^$ ]] && continue; ipset add whitelist "$ip" -exist; done < "$WHITELIST_FILE"
-# Populate block zones & ASNs
 for file in "$ZONE_DIR"/*.zone; do
   base=$(basename "$file")
   set="block_zone"
   [[ "$base" =~ ^AS[0-9]+ ]] && set="block_asn"
+  [[ "$base" =~ ^(sg|ph|id|th)\.zone$ ]] && continue
   while read -r ip; do [[ "$ip" =~ ^#|^$ ]] && continue; ipset add "$set" "$ip" -exist; done < "$file"
 done
 
-# 8) BUILD iptables rules
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT ACCEPT
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+# Allow from whitelist & allowed countries
 iptables -A INPUT -m set --match-set whitelist src -j ACCEPT
+iptables -A INPUT -m set --match-set allow_countries src -j ACCEPT
 iptables -A INPUT -m set --match-set block_zone src -j DROP
 iptables -A INPUT -m set --match-set block_asn src -j DROP
-iptables -A INPUT -p tcp --dport 22 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
 
+# Your game/app ports with ratelimit
 while read -r p; do
   iptables -A INPUT -p tcp --dport "$p" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
   iptables -A INPUT -p tcp --dport "$p" -m limit --limit "$RATE_LIMIT/sec" --limit-burst "$RATE_LIMIT" -j ACCEPT
 done < "$PORT_FILE"
 
+# BLOCK ALL HTTP METHODS & PACKETS
+iptables -A INPUT -p tcp -m string --string "GET " --algo bm -j DROP
+iptables -A INPUT -p tcp -m string --string "POST " --algo bm -j DROP
+iptables -A INPUT -p tcp -m string --string "HEAD " --algo bm -j DROP
+iptables -A INPUT -p tcp -m string --string "HTTP" --algo bm -j DROP
+
 iptables -A INPUT -j DROP
 
-# 9) SAVE
 iptables-save > /etc/iptables/rules.v4
 ipset save > /etc/iptables/ipsets.conf
 
-echo "✅ rofirewall (iptables) loaded: ports ($(paste -sd, "$PORT_FILE")), blocks & whitelists applied."
+echo "✅ rofirewall: custom/NAT/knock/country/HTTP/u32/whitelist/ratelimit rules applied."
+iptables -t nat -L PREROUTING -n --line-numbers
+iptables -L FORWARD     -n --line-numbers
 EOF
 sudo chmod +x /usr/local/bin/rofirewall
